@@ -659,3 +659,32 @@ body {
 
 /* ── Scrollbar (global) ───────────────────────────────── */
 * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+/* ── Hotspot & stat additions ──────────────────────────── */
+.stat-count {
+  background: rgba(88,166,255,.12);
+  color: var(--blue);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+
+.hotspot-badge {
+  font-size: 11px;
+  margin: 0 3px;
+  flex-shrink: 0;
+}
+
+.file-item.is-hotspot .file-path {
+  color: var(--orange);
+}
+
+/* Rate limit warning colors */
+.rate-badge.warn  { color: var(--orange) !important; }
+.rate-badge.alert { color: var(--red)    !important; }
+
+/* Processing state message */
+#loading-message.processing {
+  color: var(--blue);
+}

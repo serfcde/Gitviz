@@ -1,7 +1,7 @@
 /**
  * App — main controller.
  * Orchestrates API client, graph builder, and visualizer.
- * Manages the state machine: idle → loading → processing → visualized → error.
+ * State machine: idle → loading → processing → visualized → error
  */
 class App {
   constructor() {
@@ -101,10 +101,33 @@ class App {
 
     // Keyboard shortcuts
     document.addEventListener('keydown', e => {
+      // Ctrl/Cmd+K → focus URL input
       if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
         e.preventDefault();
         this.el.urlInput.focus();
         this.el.urlInput.select();
+        return;
+      }
+
+      // Arrow/+/- keys → zoom/pan when graph is visible and input not focused
+      if (this.state !== 'visualized') return;
+      if (document.activeElement === this.el.urlInput) return;
+
+      switch (e.key) {
+        case '+':
+        case '=':
+          e.preventDefault();
+          this.visualizer.zoomIn();
+          break;
+        case '-':
+        case '_':
+          e.preventDefault();
+          this.visualizer.zoomOut();
+          break;
+        case '0':
+          e.preventDefault();
+          this.visualizer.resetView();
+          break;
       }
     });
 
@@ -119,16 +142,10 @@ class App {
   async _load() {
     const rawUrl = this.el.urlInput.value.trim();
 
-    if (!rawUrl) {
-      this._showError('Please enter a repository URL (e.g. https://github.com/owner/repo).');
-      return;
-    }
-
-    if (!this.api.validateUrl(rawUrl)) {
-      this._showError(
-        'Invalid GitHub URL format. Expected: https://github.com/owner/repository\n' +
-        'Make sure there is no trailing path (no /tree/main etc.).'
-      );
+    // Specific validation error messages (covers TCRL03–TCRL09)
+    const validationErr = this.api.getValidationError(rawUrl);
+    if (validationErr) {
+      this._showError(validationErr);
       return;
     }
 
@@ -137,17 +154,16 @@ class App {
     catch (e) { this._showError(e.message); return; }
 
     this._setState('loading');
-    this._setLoadingMsg('Connecting to GitHub API…');
     this.api.clearCache();
 
     try {
       /* 1 — Repo metadata */
-      this._setLoadingMsg('Fetching repository metadata…');
+      this._setLoadingMsg('Connecting to GitHub API…');
       const repoData = await this.api.fetchRepo(owner, repo);
 
       if (repoData.private) {
         throw new Error(
-          'This repository is private. GitViz only supports public repositories.'
+          'This repository is private or inaccessible. GitViz only supports public repositories.'
         );
       }
 
@@ -156,7 +172,13 @@ class App {
 
       /* 2 — Branches */
       this._setLoadingMsg('Fetching branches…');
-      const branchesRaw = await this.api.fetchBranches(owner, repo);
+      let branchesRaw = [];
+      try {
+        branchesRaw = await this.api.fetchBranches(owner, repo);
+      } catch (e) {
+        // Partial data: warn but continue (TCEH-09)
+        console.warn('Branch fetch failed:', e.message);
+      }
 
       /* 3 — Commits */
       this._setLoadingMsg('Fetching commit history (up to 300)…');
@@ -167,12 +189,12 @@ class App {
       }
 
       /* 4 — Build DAG */
+      this._setState('processing');
       this._setLoadingMsg('Building commit graph…');
       this.graph.build(commitsRaw, branchesRaw);
 
       /* 5 — Render */
       this._setLoadingMsg('Rendering visualization…');
-      // Let the DOM breathe before heavy D3 work
       await this._tick();
       this.visualizer.render(this.graph);
 
@@ -212,13 +234,19 @@ class App {
     // Merge badge
     this.el.cdMergeRow.style.display = node.isMerge ? '' : 'none';
 
-    // File changes
+    // File changes (use cache if already loaded for this node)
     this.el.cdFileStats.innerHTML     = '';
-    this.el.cdFileLoading.style.display = 'block';
-    this.el.cdFileLoading.textContent = 'Loading file changes…';
     this.el.cdFileList.innerHTML      = '';
 
-    this._loadFileChanges(node.sha);
+    if (node.fileChanges !== null) {
+      // Already loaded — render immediately
+      this._renderFileChanges(node, node.fileChanges);
+    } else {
+      this.el.cdFileLoading.style.display = 'block';
+      this.el.cdFileLoading.textContent   = 'Loading file changes…';
+      this._loadFileChanges(node);
+    }
+
     this._updateRateLimit();
   }
 
@@ -227,55 +255,69 @@ class App {
     this.el.commitDetails.classList.add('hidden');
   }
 
-  async _loadFileChanges(sha) {
+  async _loadFileChanges(node) {
     if (!this.currentRepo) return;
     const { owner, repo } = this.currentRepo;
 
     try {
-      const detail = await this.api.fetchCommitDetail(owner, repo, sha);
+      const detail = await this.api.fetchCommitDetail(owner, repo, node.sha);
       const files  = detail.files || [];
 
+      // Record in graph for churn tracking (TC-FE-08, TC-FE-10)
+      this.graph.recordFileChanges(node.sha, files);
+
       this.el.cdFileLoading.style.display = 'none';
-
-      if (!files.length) {
-        this.el.cdFileList.innerHTML =
-          '<p class="no-file-changes">No file changes for this commit.</p>';
-        return;
-      }
-
-      // Stats
-      const add  = files.reduce((s, f) => s + (f.additions || 0), 0);
-      const del  = files.reduce((s, f) => s + (f.deletions  || 0), 0);
-      this.el.cdFileStats.innerHTML =
-        `<span class="stat-chip stat-add">+${add}</span>` +
-        `<span class="stat-chip stat-del">−${del}</span>`;
-
-      // File list HTML
-      const html = files.map(f => {
-        const typeMap  = { added:'A', removed:'D', modified:'M', renamed:'R', copied:'C' };
-        const classMap = {
-          added:'file-added', removed:'file-deleted', modified:'file-modified',
-          renamed:'file-renamed', copied:'file-renamed'
-        };
-        const badge = typeMap[f.status]  || 'M';
-        const cls   = classMap[f.status] || 'file-modified';
-        const name  = f.filename;
-        const addTxt = f.additions ? `<span class="file-add">+${f.additions}</span>` : '';
-        const delTxt = f.deletions ? `<span class="file-del">−${f.deletions}</span>`  : '';
-
-        return `<div class="file-item ${cls}">
-          <span class="file-type-badge">${badge}</span>
-          <span class="file-path" title="${name}">${name}</span>
-          <span class="file-diff">${addTxt}${delTxt}</span>
-        </div>`;
-      }).join('');
-
-      this.el.cdFileList.innerHTML = html;
+      this._renderFileChanges(node, files);
       this._updateRateLimit();
 
     } catch (err) {
       this.el.cdFileLoading.textContent = `Could not load file changes: ${err.message}`;
     }
+  }
+
+  _renderFileChanges(node, files) {
+    this.el.cdFileLoading.style.display = 'none';
+
+    if (!files.length) {
+      this.el.cdFileList.innerHTML =
+        '<p class="no-file-changes">No file changes for this commit.</p>';
+      return;
+    }
+
+    // Stats row
+    const add = files.reduce((s, f) => s + (f.additions || 0), 0);
+    const del = files.reduce((s, f) => s + (f.deletions  || 0), 0);
+    this.el.cdFileStats.innerHTML =
+      `<span class="stat-chip stat-add">+${add}</span>` +
+      `<span class="stat-chip stat-del">−${del}</span>` +
+      `<span class="stat-chip stat-count">${files.length} files</span>`;
+
+    // File list
+    const typeMap  = { added:'A', removed:'D', modified:'M', renamed:'R', copied:'C' };
+    const classMap = {
+      added:'file-added', removed:'file-deleted', modified:'file-modified',
+      renamed:'file-renamed', copied:'file-renamed'
+    };
+
+    const html = files.map(f => {
+      const badge     = typeMap[f.status]  || 'M';
+      const cls       = classMap[f.status] || 'file-modified';
+      const isHot     = this.graph.isHotspot(f.filename);
+      const hotBadge  = isHot
+        ? '<span class="hotspot-badge" title="Development hotspot 🔥">🔥</span>'
+        : '';
+      const addTxt = f.additions ? `<span class="file-add">+${f.additions}</span>` : '';
+      const delTxt = f.deletions ? `<span class="file-del">−${f.deletions}</span>`  : '';
+
+      return `<div class="file-item ${cls}${isHot ? ' is-hotspot' : ''}">
+        <span class="file-type-badge">${badge}</span>
+        <span class="file-path" title="${f.filename}">${f.filename}</span>
+        ${hotBadge}
+        <span class="file-diff">${addTxt}${delTxt}</span>
+      </div>`;
+    }).join('');
+
+    this.el.cdFileList.innerHTML = html;
   }
 
   /* ── Branch Legend ───────────────────────────────────── */
@@ -298,12 +340,12 @@ class App {
     const isLoading = state === 'loading' || state === 'processing';
     this.el.loadingOverlay.classList.toggle('hidden', !isLoading);
     this.el.errorOverlay.classList.toggle('hidden',   state !== 'error');
-    this.el.emptyState.style.display = state === 'idle'       ? '' : 'none';
+    this.el.emptyState.style.display = state === 'idle' ? '' : 'none';
     this.el.loadBtn.disabled          = isLoading;
 
     if (state === 'idle') {
       this._hideCommitDetails();
-      this.el.repoLabel.textContent  = '';
+      this.el.repoLabel.textContent   = '';
       this.el.commitCount.textContent = '';
       this.el.legendTags.innerHTML    = '';
       this.el.rateLimit.textContent   = '';
@@ -322,7 +364,10 @@ class App {
   /* ── Rate Limit ──────────────────────────────────────── */
 
   _updateRateLimit() {
-    this.el.rateLimit.textContent = `API: ${this.api.rateLimitRemaining}/60`;
+    const n = this.api.rateLimitRemaining;
+    this.el.rateLimit.textContent = `API: ${n}/60`;
+    // Visual warning when low
+    this.el.rateLimit.style.color = n <= 10 ? '#ffa657' : n <= 5 ? '#ff7b72' : '';
   }
 
   /* ── Utility ─────────────────────────────────────────── */
